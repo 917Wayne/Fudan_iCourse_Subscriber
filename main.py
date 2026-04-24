@@ -6,6 +6,7 @@ Runs a single check: login → detect new lectures → stream audio → transcri
 
 import time
 import traceback
+from datetime import datetime
 
 from src import config
 from src.database import Database
@@ -153,6 +154,10 @@ def run():
     print("iCourse Subscriber — starting run")
     print("=" * 60)
 
+    # 设定起始日期：2026年4月11日
+    START_DATE = datetime(2026, 4, 11)
+    print(f"[*] 起始日期过滤已开启：仅处理 {START_DATE.strftime('%Y-%m-%d')} 及之后的课程")
+
     if not config.COURSE_IDS:
         print("No COURSE_IDS configured. Set the COURSE_IDS env var.")
         return
@@ -182,13 +187,26 @@ def run():
 
             db.upsert_course(course_id, course_title, teacher)
 
-            # Find new lectures with playback + previously failed (unprocessed) ones
+            # 查找有回放且未处理的新课程
             known_processed = db.get_processed_sub_ids(course_id)
-            new_lectures = [
-                lec for lec in lectures
-                if lec.get("has_playback")
-                and str(lec["sub_id"]) not in known_processed
-            ]
+            
+            # --- 核心修改：在此处增加日期过滤 ---
+            filtered_new = []
+            for lec in lectures:
+                if lec.get("has_playback") and str(lec["sub_id"]) not in known_processed:
+                    lec_date_str = lec.get("date", "")
+                    if lec_date_str:
+                        try:
+                            lec_date = datetime.strptime(lec_date_str, '%Y-%m-%d')
+                            if lec_date < START_DATE:
+                                # 日期早于 4月11日，跳过
+                                continue
+                        except ValueError:
+                            pass # 如果日期格式不对，保守起见不跳过
+                    filtered_new.append(lec)
+            
+            new_lectures = filtered_new
+
             # Deduplicate by sub_title (school system sometimes lists duplicates)
             seen_titles = set()
             deduped = []
@@ -201,17 +219,28 @@ def run():
                 seen_titles.add(title)
                 deduped.append(lec)
             new_lectures = deduped
+
             # Also retry any previously inserted but unprocessed
             unprocessed = db.get_unprocessed_lectures(course_id)
             new_ids = {str(lec["sub_id"]) for lec in new_lectures}
-            # Merge: new from API + retries from DB
-            retry_only = [
-                {"sub_id": u["sub_id"], "sub_title": u["sub_title"], "date": u["date"]}
-                for u in unprocessed if u["sub_id"] not in new_ids
-            ]
+            
+            # 同样对重试队列应用日期过滤
+            retry_only = []
+            for u in unprocessed:
+                if u["sub_id"] not in new_ids:
+                    u_date_str = u.get("date", "")
+                    if u_date_str:
+                        try:
+                            u_date = datetime.strptime(u_date_str, '%Y-%m-%d')
+                            if u_date < START_DATE:
+                                continue
+                        except ValueError:
+                            pass
+                    retry_only.append({"sub_id": u["sub_id"], "sub_title": u["sub_title"], "date": u["date"]})
+            
             new_lectures.extend(retry_only)
 
-            print(f"  New/retry lectures: {len(new_lectures)}")
+            print(f"  New/retry lectures (Filtered): {len(new_lectures)}")
 
             if not new_lectures:
                 print("  No new lectures, skipping.")
