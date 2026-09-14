@@ -6,7 +6,7 @@ Runs a single check: login → detect new lectures → stream audio → transcri
 
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src import config
 from src.database import Database
@@ -26,13 +26,7 @@ def process_lecture(
     course_title: str,
     lecture: dict,
 ) -> str | None:
-    """Download, transcribe, and summarize a single lecture.
-
-    Supports stage-skipping: if a previous run already produced a transcript
-    or summary, that stage is not repeated.
-
-    Returns the summary string, or None if no summary was produced.
-    """
+    """Download, transcribe, and summarize a single lecture."""
     sub_id = str(lecture["sub_id"])
     sub_title = lecture.get("sub_title", sub_id)
     date = lecture.get("date", "")
@@ -41,12 +35,11 @@ def process_lecture(
     print(f"    [Time] Start: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     t_start = time.time()
 
-    # Check existing progress for stage-skipping
     existing = db.get_lecture(sub_id)
     has_transcript = existing and existing.get("transcript")
     has_summary = existing and existing.get("summary")
 
-    # 1) Transcribe (stream audio directly from CDN — no video download)
+    # 1) Transcribe
     if has_transcript:
         print(f"    Transcript exists ({len(existing['transcript'])} chars), skipping transcription.")
         transcript = existing["transcript"]
@@ -72,14 +65,12 @@ def process_lecture(
             except IncompleteAudioError as e:
                 print(f"    [WARN] Attempt {attempt}/{max_attempts}: {e}")
                 if attempt < max_attempts:
-                    # Re-login and get fresh URL for retry
                     client = _check_session(client)
                     video_url = client.get_video_url(course_id, sub_id)
                     vpn_url, http_headers = client.get_stream_params(video_url)
                     print(f"    Retrying with fresh connection...")
                 else:
                     print(f"    [FAIL] All {max_attempts} attempts got incomplete audio, using best result.")
-                    # Use the partial transcript rather than failing entirely
                     transcript = transcriber._last_transcript
                     db.update_transcript(sub_id, transcript)
             except NoAudioStreamError as e:
@@ -154,9 +145,9 @@ def run():
     print("iCourse Subscriber — starting run")
     print("=" * 60)
 
-    # 设定起始日期：2026年4月11日
-    START_DATE = datetime(2026, 4, 11)
-    print(f"[*] 起始日期过滤已开启：仅处理 {START_DATE.strftime('%Y-%m-%d')} 及之后的课程")
+    # 动态滑动窗口：仅处理前 3 天内的新课，彻底过滤旧学期积压
+    cutoff_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+    print(f"[*] 动态日期过滤：只处理 {cutoff_date} 及之后的课程")
 
     if not config.COURSE_IDS:
         print("No COURSE_IDS configured. Set the COURSE_IDS env var.")
@@ -169,7 +160,6 @@ def run():
 
     vpn = login_with_retry()
     client = ICourseClient(vpn)
-    email_items = []
 
     for course_id in config.COURSE_IDS:
         try:
@@ -187,63 +177,32 @@ def run():
 
             db.upsert_course(course_id, course_title, teacher)
 
-            # 查找有回放且未处理的新课程
             known_processed = db.get_processed_sub_ids(course_id)
-            
-            # --- 核心修改：在此处增加日期过滤 ---
-            filtered_new = []
+            new_lectures = []
             for lec in lectures:
                 if lec.get("has_playback") and str(lec["sub_id"]) not in known_processed:
-                    lec_date_str = lec.get("date", "")
-                    if lec_date_str:
-                        try:
-                            lec_date = datetime.strptime(lec_date_str, '%Y-%m-%d')
-                            if lec_date < START_DATE:
-                                # 日期早于 4月11日，跳过
-                                continue
-                        except ValueError:
-                            pass # 如果日期格式不对，保守起见不跳过
-                    filtered_new.append(lec)
-            
-            new_lectures = filtered_new
+                    lec_date = lec.get("date", "")
+                    # 仅保留最近 3 天内的课
+                    if lec_date and lec_date < cutoff_date:
+                        continue
+                    new_lectures.append(lec)
 
-            # Deduplicate by sub_title (school system sometimes lists duplicates)
+            # 去重
             seen_titles = set()
             deduped = []
             for lec in new_lectures:
                 title = lec.get("sub_title", "")
                 if title in seen_titles:
-                    print(f"  [Dedup] Skipping duplicate: {title}"
-                          f" (sub_id={lec['sub_id']})")
+                    print(f"  [Dedup] Skipping duplicate: {title} (sub_id={lec['sub_id']})")
                     continue
                 seen_titles.add(title)
                 deduped.append(lec)
             new_lectures = deduped
 
-            # Also retry any previously inserted but unprocessed
-            unprocessed = db.get_unprocessed_lectures(course_id)
-            new_ids = {str(lec["sub_id"]) for lec in new_lectures}
-            
-            # 同样对重试队列应用日期过滤
-            retry_only = []
-            for u in unprocessed:
-                if u["sub_id"] not in new_ids:
-                    u_date_str = u.get("date", "")
-                    if u_date_str:
-                        try:
-                            u_date = datetime.strptime(u_date_str, '%Y-%m-%d')
-                            if u_date < START_DATE:
-                                continue
-                        except ValueError:
-                            pass
-                    retry_only.append({"sub_id": u["sub_id"], "sub_title": u["sub_title"], "date": u["date"]})
-            
-            new_lectures.extend(retry_only)
-
-            print(f"  New/retry lectures (Filtered): {len(new_lectures)}")
+            print(f"  New lectures to process: {len(new_lectures)}")
 
             if not new_lectures:
-                print("  No new lectures, skipping.")
+                print("  No new lectures in window, skipping.")
                 continue
 
             for lecture in new_lectures:
@@ -259,47 +218,27 @@ def run():
                         client, db, transcriber, summarizer,
                         course_id, course_title, lecture,
                     )
-                    if summary:
-                        email_items.append({
+                    # 优化：单课单发，生成一个总结立即投递一封邮件，绝不堆积
+                    if summary and emailer:
+                        single_item = [{
                             "sub_id": sub_id,
                             "course_title": course_title,
                             "sub_title": lecture.get("sub_title", sub_id),
                             "date": lecture.get("date", ""),
                             "summary": summary,
-                        })
+                        }]
+                        print(f"\n[Email] Sending summary for lecture {sub_id}...")
+                        if emailer.send(single_item):
+                            db.mark_emailed_batch([sub_id])
+                            print(f"[Email] Successfully delivered to mailbox.")
+                        else:
+                            print(f"[Email] Send failed for {sub_id}, will retry next cycle.")
                 except Exception:
                     print(f"    ERROR processing {sub_id}:")
                     traceback.print_exc()
 
         except Exception:
             print(f"  ERROR processing course {course_id}:")
-            traceback.print_exc()
-
-    # Recover any previously processed-but-unsent lectures
-    unsent = db.get_unsent_lectures()
-    if unsent:
-        seen_sub_ids = {item["sub_id"] for item in email_items}
-        for row in unsent:
-            if row["sub_id"] not in seen_sub_ids:
-                email_items.append({
-                    "sub_id": row["sub_id"],
-                    "course_title": row["course_title"],
-                    "sub_title": row["sub_title"],
-                    "date": row["date"],
-                    "summary": row["summary"],
-                })
-        print(f"[Email] Including {len(unsent)} previously unsent lecture(s).")
-
-    # Send one email with all summaries
-    if emailer and email_items:
-        try:
-            print(f"\n[Email] Sending summary for {len(email_items)} lecture(s)...")
-            if emailer.send(email_items):
-                db.mark_emailed_batch([item["sub_id"] for item in email_items])
-            else:
-                print("[Email] Send failed, lectures will be retried next run.")
-        except Exception:
-            print("[Email] Failed to send:")
             traceback.print_exc()
 
     print(f"\n{'=' * 60}")
