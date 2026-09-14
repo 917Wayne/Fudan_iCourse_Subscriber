@@ -2,8 +2,8 @@ name: iCourse Check
 
 on:
   schedule:
-    # Every day at 21:00 BTC (UTC + 8)
-    - cron: "0 13 * * *"
+    # 每天北京时间 12:30, 21:30, 23:00 运行 (对应 UTC 04:30, 13:30, 15:00)
+    - cron: "30 4,13,15 * * *"
   workflow_dispatch:
 
 permissions:
@@ -119,7 +119,6 @@ jobs:
             exit 0
           fi
 
-          # Re-fetch latest remote DB (may have been updated by concurrent workflow)
           DEPLOY_DB=data/icourse.db
           git fetch origin data --depth=1 2>/dev/null || echo "No data branch yet."
           if git rev-parse origin/data >/dev/null 2>&1; then
