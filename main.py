@@ -146,7 +146,7 @@ def run():
     print("=" * 60)
 
     # 动态滑动窗口：仅处理前 3 天内的新课，彻底过滤旧学期积压
-    cutoff_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+    cutoff_date = (datetime.now() - timedelta(days=8)).strftime("%Y-%m-%d")
     print(f"[*] 动态日期过滤：只处理 {cutoff_date} 及之后的课程")
 
     if not config.COURSE_IDS:
