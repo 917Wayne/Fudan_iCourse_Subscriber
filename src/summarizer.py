@@ -1,4 +1,4 @@
-"""LLM-based course lecture summarization via ModelScope API."""
+"""LLM-based course lecture summarization via DashScope (Aliyun Bailian) API."""
 
 import time
 
@@ -80,22 +80,24 @@ SYSTEM_PROMPT = r"""你是一个专业的课程助教。你的任务是根据用
 请牢记：**只要内容在逻辑上是连贯递进的，就必须写成段落；列表仅用于真正意义上的并列枚举（如对比多个独立选项、罗列参考文献等）。**"""
 
 class Summarizer:
-    """Course lecture summarizer using ModelScope OpenAI-compatible API."""
+    """Course lecture summarizer using DashScope (Bailian) OpenAI-compatible API."""
 
     def __init__(self):
         if not config.DASHSCOPE_API_KEY:
             raise ValueError("DASHSCOPE_API_KEY is not set")
+        
+        # 指向阿里云百炼官方兼容端点
         self.client = OpenAI(
             api_key=config.DASHSCOPE_API_KEY,
-            base_url=config.LLM_BASE_URL,
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         )
         
-        # 严格匹配 ModelScope 官方模型库 ID 格式（首字母大写）
+        # 百炼官方稳定模型列表（享受千万级免费额度，按优先级排列）
         self.models = [
-            "Qwen/Qwen2.5-72B-Instruct",
-            "Qwen/Qwen2.5-32B-Instruct",
-            "Qwen/Qwen2.5-14B-Instruct",
-            "Qwen/Qwen2.5-7B-Instruct",
+            "qwen-plus",
+            "qwen-turbo",
+            "qwen2.5-72b-instruct",
+            "qwen2.5-32b-instruct"
         ]
 
         self._gemini_client = None
@@ -130,17 +132,7 @@ class Summarizer:
         return result
 
     def summarize(self, title: str, content: str) -> tuple[str, str]:
-        """Summarize lecture content, trying Gemini first then ModelScope models.
-
-        If GEMINI_API_KEY is set, Gemini is tried first. On failure (or when
-        the key is absent), all ModelScope models are tried in order.
-
-        Returns:
-            (summary, model_used) tuple.
-
-        Raises:
-            RuntimeError: If all models fail.
-        """
+        """Summarize lecture content, trying Gemini first then DashScope models."""
         if not content or not content.strip():
             return ("（内容为空）", "")
 
@@ -158,7 +150,7 @@ class Summarizer:
                     print(f"[Summarizer] gemini/{model} failed: {type(e).__name__}: {e}")
                     errors.append(f"gemini/{model}: {e}")
 
-        # Fallback: ModelScope models
+        # Fallback: DashScope models
         for model in self.models:
             try:
                 result = self._call_llm(self.client, model, title, content)
