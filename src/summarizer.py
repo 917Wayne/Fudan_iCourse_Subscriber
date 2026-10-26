@@ -95,7 +95,6 @@ class Summarizer:
         # 百炼官方稳定模型列表（享受千万级免费额度，按优先级排列）
         self.models = [
             "qwen-plus",
-            "qwen-turbo",
             "qwen2.5-72b-instruct",
             "qwen2.5-32b-instruct"
         ]
