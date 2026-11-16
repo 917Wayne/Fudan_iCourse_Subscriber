@@ -21,10 +21,7 @@ from . import config
 
 
 def encrypt_host(hostname: str) -> str:
-    """Encrypt hostname using AES-128-CFB for WebVPN URL encoding.
-
-    Returns the hex-encoded ciphertext of the hostname.
-    """
+    """Encrypt hostname using AES-128-CFB for WebVPN URL encoding."""
     key = config.WEBVPN_AES_KEY
     iv = config.WEBVPN_AES_IV
     cipher = AES.new(key, AES.MODE_CFB, iv, segment_size=128)
@@ -43,13 +40,7 @@ def decrypt_host(ciphertext_hex: str) -> str:
 
 
 def get_vpn_url(url: str) -> str:
-    """Convert a regular URL to its WebVPN proxy URL.
-
-    Example:
-        https://icourse.fudan.edu.cn/courseapi/v3/...
-        ->
-        https://webvpn.fudan.edu.cn/https/77726476706e69737468656265737421f9f44e.../courseapi/v3/...
-    """
+    """Convert a regular URL to its WebVPN proxy URL."""
     parsed = urlparse(url)
     protocol = parsed.scheme
     hostname = parsed.hostname
@@ -60,13 +51,11 @@ def get_vpn_url(url: str) -> str:
     if parsed.fragment:
         path += "#" + parsed.fragment
 
-    # Remove leading slash from path for concatenation
     path = path.lstrip("/")
 
     encrypted = encrypt_host(hostname)
     iv_hex = hexlify(config.WEBVPN_AES_IV).decode("ascii")
 
-    # Include non-standard port
     port_suffix = ""
     if port and not (
         (protocol == "http" and port == 80)
@@ -87,11 +76,10 @@ def get_ordinary_url(vpn_url: str) -> str:
     if len(path_parts) < 2:
         raise ValueError(f"Invalid WebVPN URL: {vpn_url}")
 
-    protocol_part = path_parts[0]  # e.g. "https" or "https-8080"
-    encoded_host = path_parts[1]  # IV + ciphertext
+    protocol_part = path_parts[0]
+    encoded_host = path_parts[1]
     rest = path_parts[2] if len(path_parts) > 2 else ""
 
-    # Parse protocol and optional port
     if "-" in protocol_part:
         protocol, port_str = protocol_part.rsplit("-", 1)
         port = f":{port_str}"
@@ -99,7 +87,6 @@ def get_ordinary_url(vpn_url: str) -> str:
         protocol = protocol_part
         port = ""
 
-    # Strip the 32-char IV hex prefix
     iv_hex_len = 32
     ciphertext_hex = encoded_host[iv_hex_len:]
     hostname = decrypt_host(ciphertext_hex)
@@ -121,10 +108,7 @@ class WebVPNSession:
         self.logged_in = False
 
     def login(self, student_id: str = None, password: str = None) -> bool:
-        """Execute the full 7-step IDP authentication flow.
-
-        Returns True on success, raises on failure.
-        """
+        """Execute the full 7-step IDP authentication flow."""
         student_id = student_id or config.STUDENT_ID
         password = password or config.PASSWORD
 
@@ -166,29 +150,35 @@ class WebVPNSession:
         print("[*] WebVPN login successful!")
         return True
 
+    def _is_icourse_authenticated(self) -> bool:
+        """Check if iCourse session is already active via userapi."""
+        test_url = get_vpn_url(f"{config.ICOURSE_BASE}/userapi/v1/infosimple")
+        try:
+            resp = self.session.get(test_url, timeout=15)
+            if resp.status_code == 200:
+                user_data = resp.json()
+                if user_data.get("code") in (0, 200):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def authenticate_icourse(
         self, student_id: str = None, password: str = None
     ) -> bool:
-        """Authenticate to iCourse via CAS/IDP through WebVPN.
-
-        Mimics the browser flow:
-        1. Access casapi login URL (like clicking "校内用户登录")
-        2. Follow redirect to IDP authenticate (casapi generates correct
-           service URL with forward param and r=auth/login)
-        3. IDP auth steps through WebVPN
-        4. Follow ticket back to iCourse through WebVPN
-        """
+        """Authenticate to iCourse via CAS/IDP through WebVPN with SSO fallback."""
         student_id = student_id or config.STUDENT_ID
         password = password or config.PASSWORD
 
         print("[*] Starting iCourse CAS authentication through WebVPN...")
+
+        if self._is_icourse_authenticated():
+            print("    Verified: already logged in to iCourse via WebVPN SSO session.")
+            print("[*] iCourse authentication successful!")
+            return True
+
         idp_vpn_base = get_vpn_url(config.IDP_BASE)
 
-        # Step 1: Initiate CAS login via casapi
-        # This is equivalent to clicking "校内用户登录" in the browser.
-        # casapi will 302-redirect to IDP with the correct service URL:
-        #   service=https://icourse.fudan.edu.cn/casapi/index.php
-        #          ?forward=https%3A%2F%2Ficourse.fudan.edu.cn%2F&r=auth/login
         print("[1/7] Initiating CAS login via casapi...")
         casapi_url = (
             f"{config.ICOURSE_BASE}/casapi/index.php"
@@ -198,13 +188,26 @@ class WebVPNSession:
         )
         vpn_url = get_vpn_url(casapi_url)
 
-        # Follow redirect chain to reach IDP login page and extract lck
         resp = self.session.get(vpn_url, allow_redirects=False, timeout=30)
         lck = None
         for _ in range(15):
             location = resp.headers.get("Location", "")
             if resp.status_code not in (301, 302, 303, 307) or not location:
                 break
+
+            if "ticket=" in location:
+                ticket_url = location
+                if not ticket_url.startswith("http"):
+                    ticket_url = urljoin(resp.url, ticket_url)
+                if not ticket_url.startswith(config.WEBVPN_BASE):
+                    ticket_url = get_vpn_url(ticket_url)
+                print("    Auto-SSO: Following ticket redirect...")
+                self.session.get(ticket_url, allow_redirects=True, timeout=30)
+                if self._is_icourse_authenticated():
+                    print("    Verified: login OK via auto-ticket")
+                    print("[*] iCourse authentication successful!")
+                    return True
+
             lck_match = re.search(r'lck=([^&#"]+)', location)
             if lck_match:
                 lck = lck_match.group(1)
@@ -216,13 +219,17 @@ class WebVPNSession:
             )
 
         if not lck:
-            # Check final response URL and body
             for source in [resp.url, resp.text[:5000]]:
                 m = re.search(r'lck=([^&#"]+)', source)
                 if m:
                     lck = m.group(1)
                     break
+
         if not lck:
+            if self._is_icourse_authenticated():
+                print("    Verified: login OK (SSO session established without form)")
+                print("[*] iCourse authentication successful!")
+                return True
             raise RuntimeError(
                 f"Failed to extract lck from CAS redirect chain (status={resp.status_code})"
             )
@@ -230,7 +237,6 @@ class WebVPNSession:
         entity_id = config.ICOURSE_BASE
         print("    lck: OK")
 
-        # Step 2: Query auth methods (through WebVPN)
         print("[2/7] Querying auth methods (via WebVPN)...")
         url = get_vpn_url(f"{config.IDP_BASE}/idp/authn/queryAuthMethods")
         resp = self.session.post(
@@ -256,7 +262,6 @@ class WebVPNSession:
             raise RuntimeError("No authChainCode found in response")
         print("    authChainCode: OK")
 
-        # Step 3: Get RSA public key (through WebVPN)
         print("[3/7] Getting RSA public key (via WebVPN)...")
         url = get_vpn_url(f"{config.IDP_BASE}/idp/authn/getJsPublicKey")
         resp = self.session.get(
@@ -270,11 +275,9 @@ class WebVPNSession:
             raise RuntimeError("Failed to get public key via WebVPN")
         print("    Got RSA public key")
 
-        # Step 4: Encrypt password
         print("[4/7] Encrypting password...")
         encrypted_password = self._encrypt_password(password, pub_key_b64)
 
-        # Step 5: Execute authentication (through WebVPN)
         print("[5/7] Executing authentication (via WebVPN)...")
         url = get_vpn_url(f"{config.IDP_BASE}/idp/authn/authExecute")
         payload = {
@@ -302,8 +305,12 @@ class WebVPNSession:
         data = resp.json()
 
         if str(data.get("code")) != "200":
+            if self._is_icourse_authenticated():
+                print("    Verified: login OK despite authExecute return code")
+                print("[*] iCourse authentication successful!")
+                return True
             raise RuntimeError(
-                f"iCourse CAS auth failed (code={data.get('code')})"
+                f"iCourse CAS auth failed (code={data.get('code')}, msg={data.get('message') or data.get('msg')})"
             )
 
         login_token = data.get("loginToken", "")
@@ -311,7 +318,6 @@ class WebVPNSession:
             raise RuntimeError("No loginToken in iCourse CAS response")
         print("    loginToken: OK")
 
-        # Step 6: Get CAS ticket (through WebVPN)
         print("[6/7] Getting CAS ticket (via WebVPN)...")
         url = get_vpn_url(f"{config.IDP_BASE}/idp/authCenter/authnEngine")
         resp = self.session.post(
@@ -325,8 +331,6 @@ class WebVPNSession:
         )
         html = resp.text
 
-        # Extract ticket URL from the authnEngine response
-        # The URL may already be rewritten to a WebVPN URL by the proxy
         ticket_match = re.search(
             r'locationValue\s*=\s*"([^"]*ticket=[^"]*)"', html
         )
@@ -342,7 +346,6 @@ class WebVPNSession:
         ticket_url = html_mod.unescape(ticket_match.group(1))
         print("    Ticket extracted.")
 
-        # Step 7: Follow ticket to iCourse (through WebVPN)
         print("[7/7] Following ticket to iCourse (via WebVPN)...")
         if not ticket_url.startswith(config.WEBVPN_BASE):
             ticket_url = get_vpn_url(ticket_url)
@@ -352,20 +355,10 @@ class WebVPNSession:
         )
         print(f"    Status: {resp.status_code}")
 
-        # Verify by making a test API call
-        test_url = get_vpn_url(
-            f"{config.ICOURSE_BASE}/userapi/v1/infosimple"
-        )
-        resp = self.session.get(test_url, timeout=30)
-        if resp.status_code == 200:
-            try:
-                user_data = resp.json()
-                if user_data.get("code") in (0, 200):
-                    print("    Verified: login OK")
-                    print("[*] iCourse authentication successful!")
-                    return True
-            except Exception:
-                pass
+        if self._is_icourse_authenticated():
+            print("    Verified: login OK")
+            print("[*] iCourse authentication successful!")
+            return True
 
         print("    Could not verify iCourse auth via API, proceeding...")
         return True
@@ -383,7 +376,7 @@ class WebVPNSession:
         return self.session.post(vpn_url, **kwargs)
 
     def get_raw(self, url: str, **kwargs) -> requests.Response:
-        """GET request without URL conversion (for already-converted URLs)."""
+        """GET request without URL conversion."""
         kwargs.setdefault("timeout", 30)
         return self.session.get(url, **kwargs)
 
@@ -391,8 +384,6 @@ class WebVPNSession:
         """POST request without URL conversion."""
         kwargs.setdefault("timeout", 30)
         return self.session.post(url, **kwargs)
-
-    # --- Private authentication steps ---
 
     def _get_auth_context(self) -> tuple[str, str]:
         """Step 1: GET authenticate endpoint, extract lck from redirect."""
@@ -403,7 +394,6 @@ class WebVPNSession:
         )
         resp = self.session.get(url, allow_redirects=False, timeout=30)
 
-        # Follow redirects manually to extract lck
         location = resp.headers.get("Location", "")
         while resp.status_code in (301, 302) and "lck=" not in location:
             resp = self.session.get(location, allow_redirects=False, timeout=30)
@@ -412,7 +402,6 @@ class WebVPNSession:
         if resp.status_code in (301, 302):
             location = resp.headers.get("Location", "")
 
-        # Extract lck parameter
         lck_match = re.search(r"[?&]lck=([^&]+)", location)
         if not lck_match:
             raise RuntimeError(
@@ -441,9 +430,6 @@ class WebVPNSession:
         )
         data = resp.json()
 
-        # data["data"] is a list of auth methods; pick the userAndPwd one
-        # authChainCode for userAndPwd is in the list items;
-        # requestType is at the top level
         auth_method_list = data.get("data", [])
         request_type = data.get("requestType", "chain_type")
 
@@ -479,7 +465,6 @@ class WebVPNSession:
 
     def _encrypt_password(self, password: str, pub_key_b64: str) -> str:
         """Step 4: RSA-encrypt the password with PKCS1_v1_5."""
-        # Construct PEM format
         pem = (
             "-----BEGIN PUBLIC KEY-----\n"
             + pub_key_b64
@@ -530,7 +515,6 @@ class WebVPNSession:
                 f"Authentication failed (code={data.get('code')})"
             )
 
-        # loginToken is at top level, not nested under "data"
         login_token = data.get("loginToken", "")
         if not login_token:
             raise RuntimeError("No loginToken in response")
@@ -550,16 +534,12 @@ class WebVPNSession:
             },
             timeout=30,
         )
-
-        # The response is HTML containing a JS redirect with the ticket URL
         html = resp.text
 
-        # Extract the locationValue from the JavaScript
         ticket_match = re.search(
             r'locationValue\s*=\s*"([^"]*ticket=[^"]*)"', html
         )
         if not ticket_match:
-            # Fallback: any URL with ticket= parameter
             ticket_match = re.search(
                 r'(https?://[^\s"\'<>]*ticket=[^\s"\'<>]*)', html
             )
@@ -569,18 +549,12 @@ class WebVPNSession:
                 f"Failed to extract ticket URL (response length: {len(html)})"
             )
 
-        ticket_url = ticket_match.group(1)
-        # Unescape HTML entities (e.g., &amp; -> &)
-        ticket_url = html_mod.unescape(ticket_url)
+        ticket_url = html_mod.unescape(ticket_match.group(1))
         print("    Ticket extracted.")
         return ticket_url
 
     def _establish_session(self, ticket_url: str):
-        """Step 7: Follow the ticket URL to establish WebVPN session.
-
-        The WebVPN server can be very slow. We first try without following
-        redirects to capture the session cookie quickly, then verify.
-        """
+        """Step 7: Follow the ticket URL to establish WebVPN session."""
         for attempt in range(3):
             try:
                 resp = self.session.get(
@@ -593,8 +567,6 @@ class WebVPNSession:
                     f"Failed to establish WebVPN session (status={resp.status_code})"
                 )
             except requests.exceptions.Timeout:
-                # Check if session was established despite timeout
-                # (server may have set cookies before the timeout)
                 has_ticket = any(
                     "wengine_vpn_ticket" in c.name
                     for c in self.session.cookies
