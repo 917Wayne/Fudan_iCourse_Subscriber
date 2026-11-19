@@ -6,3 +6,4 @@ openai
 pillow
 markdown
 pygments
+pyotp>=2.9.0
