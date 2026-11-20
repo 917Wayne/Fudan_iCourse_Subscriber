@@ -2,19 +2,36 @@
 WebVPN URL encoding and authentication for Fudan University with TOTP MFA support.
 """
 
+import base64
 import html as html_mod
 import re
+import time
 from binascii import hexlify, unhexlify
-from urllib.parse import urlparse, urlencode, quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 
-import requests
 import pyotp
-from Crypto.Cipher import AES
+import requests
+from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_v1_5
-import base64
 
 from . import config
+
+
+def _find_field(obj, key: str):
+    """Recursively locate a non-empty field in nested dict/list JSON responses."""
+    if isinstance(obj, dict):
+        if obj.get(key):
+            return obj[key]
+        for value in obj.values():
+            found = _find_field(value, key)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_field(item, key)
+            if found:
+                return found
+    return None
 
 
 def encrypt_host(hostname: str) -> str:
@@ -177,7 +194,6 @@ class WebVPNSession:
             f"&forward={quote(config.ICOURSE_BASE + '/', safe='')}"
         )
         vpn_casapi_url = get_vpn_url(casapi_url)
-
         idp_vpn_base = get_vpn_url(config.IDP_BASE)
 
         print("[1/7] Initiating CAS login via casapi...")
@@ -338,7 +354,7 @@ class WebVPNSession:
         request_type: str,
         use_vpn: bool = False,
     ) -> str:
-        """Step 5: Execute auth and automatically satisfy TOTP MFA if prompted."""
+        """Step 5: Execute auth and automatically satisfy userAndOtp MFA if prompted."""
         base_endpoint = f"{config.IDP_BASE}/idp/authn/authExecute"
         url = get_vpn_url(base_endpoint) if use_vpn else base_endpoint
         referer = f"{get_vpn_url(config.IDP_BASE) if use_vpn else config.IDP_BASE}/ac/"
@@ -373,45 +389,37 @@ class WebVPNSession:
                 f"Auth failed (code={data.get('code')}, msg={data.get('message') or data.get('msg')})"
             )
 
-        # Check for direct loginToken
-        login_token = data.get("loginToken")
-        if not login_token and isinstance(data.get("data"), dict):
-            login_token = data.get("data", {}).get("loginToken")
-
+        login_token = _find_field(data, "loginToken")
         if login_token:
             print("    loginToken: OK")
             return login_token
 
-        # Check if secondary authentication (OTP MFA) is required
-        print("    [MFA] Secondary authentication required. Submitting TOTP...")
+        print("    [MFA] Secondary authentication required. Submitting userAndOtp...")
         if not config.MFA_SECRET:
             raise ValueError(
                 "MFA secondary authentication triggered but MFA_SECRET is not configured."
             )
 
-        # Compute current 6-digit TOTP code
-        totp = pyotp.TOTP(config.MFA_SECRET)
-        otp_code = totp.now()
+        secret = config.MFA_SECRET.replace(" ", "").strip()
+        remaining = 30 - (int(time.time()) % 30)
+        if remaining <= 3:
+            time.sleep(remaining + 1)
+
+        otp_code = pyotp.TOTP(secret).now()
         print(f"    [MFA] Generated 6-digit dynamic code: {otp_code}")
 
-        # Extract requestNumber and secondary chain code
-        req_num = data.get("requestNumber")
-        if not req_num and isinstance(data.get("data"), dict):
-            req_num = data.get("data", {}).get("requestNumber")
-
-        second_chain = data.get("authChainCode") or auth_chain_code
+        req_num = _find_field(data, "requestNumber")
+        second_chain = _find_field(data, "authChainCode") or auth_chain_code
 
         mfa_payload = {
-            "authModuleCode": "otpAuth",
+            "authModuleCode": "userAndOtp",
             "authChainCode": second_chain,
             "entityId": entity_id,
             "requestType": request_type,
             "lck": lck,
             "authPara": {
                 "loginName": student_id,
-                "password": "",
                 "otpCode": otp_code,
-                "verifyCode": otp_code,
             },
         }
         if req_num:
@@ -429,12 +437,11 @@ class WebVPNSession:
         )
         mfa_data = mfa_resp.json()
 
-        login_token = mfa_data.get("loginToken")
-        if not login_token and isinstance(mfa_data.get("data"), dict):
-            login_token = mfa_data.get("data", {}).get("loginToken")
-
+        login_token = _find_field(mfa_data, "loginToken")
         if not login_token:
-            raise RuntimeError(f"Failed to obtain loginToken via OTP MFA: {mfa_data}")
+            raise RuntimeError(
+                f"Failed to obtain loginToken via userAndOtp: {mfa_data} | step1_data: {data}"
+            )
 
         print("    loginToken (via OTP): OK")
         return login_token
